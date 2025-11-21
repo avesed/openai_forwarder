@@ -1,0 +1,32 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments / local tooling
+.venv/
+venv/
+.python-version
+.pytest_cache/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Logs / temp files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# IDE / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Environment configs
+.env
+.env.*
