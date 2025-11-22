@@ -275,6 +275,8 @@ def stream_chat_completion(payload: Dict[str, Any], incoming_key: str | None):
         sent_role = False
         reasoning_open = False
         reasoning_accum: List[str] = []
+        tool_states: Dict[str, Dict[str, Any]] = {}
+        next_tool_index = 0
         try:
             with responses_stream as upstream_stream:
                 for event in upstream_stream:
@@ -331,6 +333,69 @@ def stream_chat_completion(payload: Dict[str, Any], incoming_key: str | None):
                         chunk = build_chat_finish_chunk(meta, response_info, reasoning_text)
                         reasoning_accum.clear()
                         yield format_sse_data(chunk)
+                    elif event_type == "response.output_item.added":
+                        item = getattr(event, "item", None)
+                        if not item:
+                            continue
+                        item_type = getattr(item, "type", "")
+                        if item_type != "function_call":
+                            continue
+                        item_id = getattr(item, "id", None) or getattr(item, "call_id", None)
+                        if not item_id:
+                            item_id = f"tool_item_{len(tool_states)}"
+                        call_id = getattr(item, "call_id", None) or item_id
+                        name = getattr(item, "name", None) or ""
+                        state = {
+                            "index": next_tool_index,
+                            "id": call_id,
+                            "name": name,
+                            "arguments": "",
+                        }
+                        tool_states[item_id] = state
+                        next_tool_index += 1
+                        tool_delta = {
+                            "index": state["index"],
+                            "id": state["id"],
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": "",
+                            },
+                        }
+                        chunk = build_chat_tool_delta_chunk(meta, [tool_delta], include_role=not sent_role)
+                        sent_role = True
+                        yield format_sse_data(chunk)
+                    elif event_type == "response.function_call_arguments.delta":
+                        item_id = getattr(event, "item_id", None)
+                        delta_text = getattr(event, "delta", "") or ""
+                        if not item_id or not delta_text:
+                            continue
+                        state = tool_states.get(item_id)
+                        if not state:
+                            continue
+                        state["arguments"] += delta_text
+                        tool_delta = {
+                            "index": state["index"],
+                            "function": {
+                                "arguments": delta_text,
+                            },
+                        }
+                        chunk = build_chat_tool_delta_chunk(meta, [tool_delta], include_role=not sent_role)
+                        sent_role = True
+                        yield format_sse_data(chunk)
+                    elif event_type == "response.function_call_arguments.done":
+                        item_id = getattr(event, "item_id", None)
+                        if not item_id:
+                            continue
+                        state = tool_states.get(item_id)
+                        if not state:
+                            continue
+                        final_args = getattr(event, "arguments", None)
+                        final_name = getattr(event, "name", None)
+                        if isinstance(final_args, str) and final_args:
+                            state["arguments"] = final_args
+                        if final_name:
+                            state["name"] = final_name
                 yield SSE_DONE
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.error("Streaming responses upstream failed: %s", exc)
@@ -392,10 +457,37 @@ def build_chat_stream_chunk(meta: Dict[str, Any], delta_text: str, include_role:
     return chunk
 
 
+def build_chat_tool_delta_chunk(
+    meta: Dict[str, Any], tool_deltas: List[Dict[str, Any]], include_role: bool = False
+) -> Dict[str, Any]:
+    chunk = {
+        "id": meta.get("id") or "chatcmpl-temp",
+        "object": "chat.completion.chunk",
+        "created": meta.get("created") or int(time.time()),
+        "model": meta.get("model") or "unknown",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": tool_deltas,
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+    if include_role:
+        chunk["choices"][0]["delta"]["role"] = "assistant"
+    return chunk
+
+
 def build_chat_finish_chunk(
     meta: Dict[str, Any], response_info: Any | None, reasoning_text: str | None = None
 ) -> Dict[str, Any]:
     finish_reason = map_stop_reason(getattr(response_info, "stop_reason", None))
+    if response_info is not None:
+        output_items = getattr(response_info, "output", None)
+        if collect_tool_calls_from_output(output_items):
+            finish_reason = "tool_calls"
     chunk = {
         "id": meta.get("id") or "chatcmpl-temp",
         "object": "chat.completion.chunk",
@@ -424,6 +516,8 @@ def map_stop_reason(value: str | None) -> str:
         "end_turn": "stop",
         "max_tokens": "length",
         "length": "length",
+        "tool_use": "tool_calls",
+        "tool_calls": "tool_calls",
     }
     return mapping.get(value, "stop")
 
@@ -502,6 +596,8 @@ def build_chat_completion_payload(body: Dict[str, Any]) -> Dict[str, Any]:
 def build_respond_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     input_blocks = convert_chat_messages_to_respond_input(body.get("messages", []))
     reasoning = extract_reasoning_config(body)
+    tools = convert_tools_for_responses(body.get("tools"), body.get("functions"))
+    tool_choice = extract_tool_choice_for_responses(body)
 
     payload = clean_dict(
         {
@@ -514,6 +610,8 @@ def build_respond_payload(body: Dict[str, Any]) -> Dict[str, Any]:
             "presence_penalty": body.get("presence_penalty"),
             "stop": body.get("stop"),
             "reasoning": reasoning,
+            "tools": tools,
+            "tool_choice": tool_choice,
         }
     )
 
@@ -562,28 +660,186 @@ def convert_respond_input_to_chat_messages(input_payload: Any) -> List[Dict[str,
 def convert_chat_messages_to_respond_input(messages_payload: Any) -> List[Dict[str, Any]]:
     items = messages_payload if isinstance(messages_payload, list) else [messages_payload]
     blocks: List[Dict[str, Any]] = []
+    tool_response_counter = 0
 
     for message in items:
         if not message:
             continue
 
-        role = message.get("role") or "user"
-        text = extract_text(message.get("content"))
-        content_type = "output_text" if role == "assistant" else "input_text"
+        role = (message.get("role") or "user").lower()
 
-        blocks.append(
-            {
-                "role": role,
-                "content": [
-                    {
-                        "type": content_type,
-                        "text": text,
-                    }
-                ],
-            }
-        )
+        if role == "tool":
+            tool_response_counter += 1
+            tool_response = convert_tool_response_message(message, tool_response_counter)
+            if tool_response:
+                blocks.append(tool_response)
+            continue
+
+        content_block = convert_standard_message_to_response_block(message)
+        if content_block:
+            blocks.append(content_block)
+
+        tool_call_blocks = convert_tool_calls_from_message(message)
+        if tool_call_blocks:
+            blocks.extend(tool_call_blocks)
 
     return blocks
+
+
+def convert_standard_message_to_response_block(message: Dict[str, Any]) -> Dict[str, Any] | None:
+    role = message.get("role") or "user"
+    text = extract_text(message.get("content"))
+    if text == "":
+        return None
+
+    content_type = "output_text" if role == "assistant" else "input_text"
+    return {
+        "role": role,
+        "content": [
+            {
+                "type": content_type,
+                "text": text,
+            }
+        ],
+    }
+
+
+def convert_tool_response_message(message: Dict[str, Any], fallback_index: int) -> Dict[str, Any] | None:
+    call_id = message.get("tool_call_id") or message.get("id") or f"tool_call_{fallback_index}"
+    output_content = extract_text(message.get("content"))
+    if call_id and output_content != "":
+        return {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output_content,
+        }
+    return None
+
+
+def convert_tool_calls_from_message(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+    calls: List[Dict[str, Any]] = []
+    raw_calls = []
+
+    if isinstance(message.get("tool_calls"), list):
+        raw_calls.extend(message["tool_calls"])
+    if message.get("function_call"):
+        raw_calls.append({"type": "function", "id": message.get("id"), "function": message["function_call"]})
+
+    for index, raw in enumerate(raw_calls):
+        call_block = convert_single_tool_call(raw, index)
+        if call_block:
+            calls.append(call_block)
+
+    return calls
+
+
+def convert_single_tool_call(tool_call: Any, ordinal: int) -> Dict[str, Any] | None:
+    if not isinstance(tool_call, dict):
+        return None
+
+    tool_type = (tool_call.get("type") or "").lower()
+    if tool_type not in ("function", "function_call"):
+        return None
+
+    function_detail = tool_call.get("function") or {}
+    if not isinstance(function_detail, dict):
+        return None
+
+    name = function_detail.get("name")
+    if not name:
+        return None
+
+    call_id = tool_call.get("id") or tool_call.get("call_id") or f"tool_call_{ordinal}"
+    arguments = stringify_function_arguments(function_detail.get("arguments"))
+
+    return {
+        "type": "function_call",
+        "name": name,
+        "arguments": arguments,
+        "call_id": call_id,
+    }
+
+
+def stringify_function_arguments(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, separators=(",", ":"))
+    except Exception:
+        return str(value)
+
+
+def convert_tools_for_responses(tools_field: Any, legacy_functions: Any) -> List[Dict[str, Any]] | None:
+    converted: List[Dict[str, Any]] = []
+
+    if isinstance(tools_field, list):
+        for tool in tools_field:
+            normalized = normalize_responses_tool(tool)
+            if normalized:
+                converted.append(normalized)
+
+    if isinstance(legacy_functions, list):
+        for function_def in legacy_functions:
+            normalized = convert_function_definition_to_tool(function_def)
+            if normalized:
+                converted.append(normalized)
+
+    return converted or None
+
+
+def normalize_responses_tool(tool: Any) -> Dict[str, Any] | None:
+    if not isinstance(tool, dict):
+        return None
+
+    tool_type = (tool.get("type") or "").lower()
+    if tool_type == "function":
+        function_def = tool.get("function") if "function" in tool else tool
+        return convert_function_definition_to_tool(function_def)
+
+    return tool
+
+
+def convert_function_definition_to_tool(function_def: Any) -> Dict[str, Any] | None:
+    if not isinstance(function_def, dict):
+        return None
+
+    name = function_def.get("name")
+    if not name:
+        return None
+
+    parameters = function_def.get("parameters")
+    if parameters is None:
+        parameters = {"type": "object", "properties": {}}
+
+    tool: Dict[str, Any] = {
+        "type": "function",
+        "name": name,
+        "description": function_def.get("description"),
+        "parameters": parameters,
+        "strict": function_def.get("strict"),
+    }
+    return tool
+
+
+def extract_tool_choice_for_responses(body: Dict[str, Any]) -> Any:
+    if "tool_choice" in body:
+        return body.get("tool_choice")
+    if "function_call" not in body:
+        return None
+
+    legacy_choice = body.get("function_call")
+    if isinstance(legacy_choice, str):
+        lowered = legacy_choice.lower()
+        if lowered in {"none", "auto", "required"}:
+            return lowered
+        return None
+    if isinstance(legacy_choice, dict):
+        name = legacy_choice.get("name")
+        if name:
+            return {"type": "function", "name": name}
+    return None
 
 
 def extract_reasoning_config(body: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -647,13 +903,20 @@ def translate_respond_to_chat(respond: Dict[str, Any]) -> Dict[str, Any]:
         final_content = f"[thinking]\n{reasoning_text}\n[/thinking]\n{final_content}"
         metadata = {"reasoning": reasoning_text}
 
+    tool_calls = collect_tool_calls_from_output(output)
+
     message_payload = {
         "role": message_block.get("role") or "assistant",
-        "content": final_content,
+        "content": final_content if final_content != "" else "",
     }
     if metadata:
         message_payload["metadata"] = metadata
+    if tool_calls:
+        message_payload["tool_calls"] = tool_calls
+        if len(tool_calls) == 1:
+            message_payload["function_call"] = tool_calls[0]["function"]
 
+    finish_reason = "tool_calls" if tool_calls else (respond.get("stop_reason") or "stop")
     return {
         "id": respond.get("id"),
         "object": "chat.completion",
@@ -663,7 +926,7 @@ def translate_respond_to_chat(respond: Dict[str, Any]) -> Dict[str, Any]:
         "choices": [
             {
                 "index": 0,
-                "finish_reason": respond.get("stop_reason") or "stop",
+                "finish_reason": finish_reason,
                 "message": message_payload,
             }
         ],
@@ -706,6 +969,47 @@ def collect_reasoning_text(output: List[Dict[str, Any]]) -> str:
             if "reasoning" in entry_type:
                 parts.append(extract_text(entry.get("content") or entry))
     return "\n".join([part for part in parts if part])
+
+
+def collect_tool_calls_from_output(output: Any) -> List[Dict[str, Any]]:
+    calls: List[Dict[str, Any]] = []
+    for block in output or []:
+        if not block:
+            continue
+        normalized = normalize_output_block(block)
+        block_type = (normalized.get("type") or "").lower()
+        if block_type not in {"function_call"}:
+            continue
+        name = normalized.get("name")
+        if not name:
+            continue
+        call_id = normalized.get("call_id") or normalized.get("id") or f"tool_call_{len(calls)}"
+        arguments = stringify_function_arguments(normalized.get("arguments"))
+        calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            }
+        )
+    return calls
+
+
+def normalize_output_block(block: Any) -> Dict[str, Any]:
+    if isinstance(block, dict):
+        return block
+    if hasattr(block, "model_dump"):
+        try:
+            return block.model_dump()
+        except Exception:
+            pass
+    try:
+        return vars(block)
+    except Exception:
+        return {}
 
 
 def log_request_details(endpoint: str, body: Dict[str, Any]) -> None:
