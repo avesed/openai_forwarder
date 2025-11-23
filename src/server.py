@@ -3,10 +3,11 @@ import logging
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
-from flask import Flask, Response, jsonify, request, stream_with_context
+from flask import Flask, Response, jsonify, request, stream_with_context, g, has_request_context
 
 # Ensure the vendored openai-python clone remains importable when not installed
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -25,6 +26,8 @@ except ImportError:
 
 PORT = int(os.getenv("FORWARDER_PORT") or os.getenv("PORT") or "3000")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_STREAM_DELTAS = os.getenv("LOG_STREAM_DELTAS", "false").lower() not in {"false", "0", ""}
+REQUEST_ID_HEADER = os.getenv("REQUEST_ID_HEADER", "X-Request-ID")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -38,6 +41,16 @@ DEFAULT_BASE_URL = (
     os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
 ).rstrip("/")
 DEFAULT_REASONING_EFFORT = os.getenv("MODEL_REASONING_EFFORT")
+ALLOWED_INCLUDE_VALUES = {
+    "file_search_call.results",
+    "web_search_call.results",
+    "web_search_call.action.sources",
+    "message.input_image.image_url",
+    "computer_call_output.output.image_url",
+    "code_interpreter_call.outputs",
+    "reasoning.encrypted_content",
+    "message.output_text.logprobs",
+}
 
 SSE_DONE = "data: [DONE]\n\n"
 
@@ -103,6 +116,19 @@ class ForwarderError(Exception):
 
 class UpstreamError(Exception):
     """Raised when OpenAI responds with an error."""
+
+
+@app.before_request
+def assign_request_id():
+    ensure_request_id()
+
+
+@app.after_request
+def attach_request_id_header(response):
+    req_id = get_request_id()
+    if req_id:
+        response.headers.setdefault(REQUEST_ID_HEADER, req_id)
+    return response
 
 
 @app.get("/health")
@@ -180,15 +206,15 @@ def respond_proxy():
     payload = build_chat_completion_payload(body)
     incoming_key = extract_incoming_api_key(request)
 
-    logger.debug("Incoming /v1/responses Authorization: %s", mask_token(incoming_key))
-    logger.debug("Incoming /v1/responses body: %s", truncate_dict(body))
+    logger.debug(with_request_context("Incoming /v1/responses Authorization: %s"), mask_token(incoming_key))
+    logger.debug(with_request_context("Incoming /v1/responses body: %s"), truncate_dict(body))
 
     logger.info(
-        "Forwarding Responses payload to chat upstream %s%s",
+        with_request_context("Forwarding Responses payload to chat upstream %s%s"),
         chat_upstream["base_url"],
         "/chat/completions",
     )
-    logger.debug("Payload: %s", truncate_dict(payload))
+    logger.debug(with_request_context("Payload: %s"), truncate_dict(payload))
 
     try:
         chat_response = call_openai(chat_upstream, "chat", payload, api_key_override=incoming_key)
@@ -214,15 +240,15 @@ def chat_proxy():
     payload = build_respond_payload(body)
     incoming_key = extract_incoming_api_key(request)
 
-    logger.debug("Incoming /v1/chat/completions Authorization: %s", mask_token(incoming_key))
-    logger.debug("Incoming /v1/chat/completions body: %s", truncate_dict(body))
+    logger.debug(with_request_context("Incoming /v1/chat/completions Authorization: %s"), mask_token(incoming_key))
+    logger.debug(with_request_context("Incoming /v1/chat/completions body: %s"), truncate_dict(body))
 
     logger.info(
-        "Forwarding Chat payload to responses upstream %s%s",
+        with_request_context("Forwarding Chat payload to responses upstream %s%s"),
         responses_upstream["base_url"],
         "/responses",
     )
-    logger.debug("Payload: %s", truncate_dict(payload))
+    logger.debug(with_request_context("Payload: %s"), truncate_dict(payload))
 
     if stream_requested:
         return stream_chat_completion(payload, incoming_key)
@@ -252,7 +278,7 @@ def call_openai(
         else:
             response = client.chat.completions.create(**payload)
     except Exception as exc:
-        logger.error("Upstream %s request failed: %s", upstream.get("name"), exc)
+        logger.error(with_request_context("Upstream %s request failed: %s"), upstream.get("name"), exc)
         raise UpstreamError(str(exc)) from exc
 
     data = response.model_dump()
@@ -398,7 +424,7 @@ def stream_chat_completion(payload: Dict[str, Any], incoming_key: str | None):
                             state["name"] = final_name
                 yield SSE_DONE
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.error("Streaming responses upstream failed: %s", exc)
+            logger.error(with_request_context("Streaming responses upstream failed: %s"), exc)
             yield format_sse_data({"error": {"message": str(exc)}})
             yield SSE_DONE
 
@@ -432,7 +458,7 @@ def create_responses_stream(
     try:
         return client.responses.stream(**payload_to_send)
     except Exception as exc:
-        logger.error("Failed to open responses stream via %s: %s", upstream.get("name"), exc)
+        logger.error(with_request_context("Failed to open responses stream via %s: %s"), upstream.get("name"), exc)
         raise UpstreamError(str(exc)) from exc
 
 
@@ -598,6 +624,7 @@ def build_respond_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     reasoning = extract_reasoning_config(body)
     tools = convert_tools_for_responses(body.get("tools"), body.get("functions"))
     tool_choice = extract_tool_choice_for_responses(body)
+    include = normalize_include_values(body.get("include"))
 
     payload = clean_dict(
         {
@@ -612,6 +639,7 @@ def build_respond_payload(body: Dict[str, Any]) -> Dict[str, Any]:
             "reasoning": reasoning,
             "tools": tools,
             "tool_choice": tool_choice,
+            "include": include,
         }
     )
 
@@ -620,7 +648,6 @@ def build_respond_payload(body: Dict[str, Any]) -> Dict[str, Any]:
         body,
         [
             "metadata",
-            "include",
             "max_tool_calls",
             "parallel_tool_calls",
             "service_tier",
@@ -688,19 +715,13 @@ def convert_chat_messages_to_respond_input(messages_payload: Any) -> List[Dict[s
 
 def convert_standard_message_to_response_block(message: Dict[str, Any]) -> Dict[str, Any] | None:
     role = message.get("role") or "user"
-    text = extract_text(message.get("content"))
-    if text == "":
+    content_entries = build_response_content_entries(message.get("content"), role)
+    if not content_entries:
         return None
 
-    content_type = "output_text" if role == "assistant" else "input_text"
     return {
         "role": role,
-        "content": [
-            {
-                "type": content_type,
-                "text": text,
-            }
-        ],
+        "content": content_entries,
     }
 
 
@@ -799,6 +820,101 @@ def normalize_responses_tool(tool: Any) -> Dict[str, Any] | None:
         return convert_function_definition_to_tool(function_def)
 
     return tool
+
+
+def normalize_include_values(include_field: Any) -> List[str] | None:
+    if include_field is None:
+        return None
+    values: List[str] = []
+    if isinstance(include_field, str):
+        cleaned = include_field.strip()
+        if cleaned:
+            maybe_add_include_value(cleaned, values)
+    elif isinstance(include_field, (list, tuple, set)):
+        for entry in include_field:
+            if isinstance(entry, str):
+                cleaned = entry.strip()
+                if cleaned:
+                    maybe_add_include_value(cleaned, values)
+    else:
+        return None
+    return values or None
+
+
+def maybe_add_include_value(candidate: str, values: List[str]) -> None:
+    if candidate in ALLOWED_INCLUDE_VALUES:
+        values.append(candidate)
+    else:
+        logger.warning(with_request_context("Dropping unsupported include value: %s"), candidate)
+
+
+def build_response_content_entries(raw_content: Any, role: str) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    if isinstance(raw_content, list):
+        for item in raw_content:
+            entry = convert_chat_content_part(item, role)
+            if entry:
+                entries.append(entry)
+    elif isinstance(raw_content, dict):
+        entry = convert_chat_content_part(raw_content, role)
+        if entry:
+            entries.append(entry)
+    else:
+        text = extract_text(raw_content)
+        if text:
+            entry = build_text_entry(text, role)
+            if entry:
+                entries.append(entry)
+    return entries
+
+
+def convert_chat_content_part(part: Any, role: str) -> Dict[str, Any] | None:
+    if isinstance(part, str):
+        return build_text_entry(part, role)
+    if not isinstance(part, dict):
+        return None
+
+    part_type = (part.get("type") or "").lower()
+    if part_type in ("text", "input_text", "output_text"):
+        text_value = part.get("text")
+        if not text_value:
+            text_value = extract_text(part.get("content"))
+        if text_value:
+            return build_text_entry(text_value, role)
+        return None
+
+    if part_type in ("image_url", "input_image"):
+        if (role or "").lower() == "assistant":
+            return None
+        image_payload = part.get("image_url")
+        url: str | None = None
+        detail = (part.get("detail") or "auto").lower() if isinstance(part.get("detail"), str) else None
+        if isinstance(image_payload, dict):
+            url = image_payload.get("url")
+            detail = image_payload.get("detail") or detail
+        elif isinstance(image_payload, str):
+            url = image_payload
+        if not url:
+            url = part.get("url")
+        if not detail:
+            detail = "auto"
+        if url:
+            entry: Dict[str, Any] = {
+                "type": "input_image",
+                "image_url": url,
+                "detail": detail,
+            }
+            if part.get("file_id"):
+                entry["file_id"] = part["file_id"]
+            return entry
+    return None
+
+
+def build_text_entry(text: str, role: str) -> Dict[str, Any] | None:
+    if not text:
+        return None
+    content_type = "output_text" if (role or "").lower() == "assistant" else "input_text"
+    return {"type": content_type, "text": text}
 
 
 def convert_function_definition_to_tool(function_def: Any) -> Dict[str, Any] | None:
@@ -1018,13 +1134,13 @@ def log_request_details(endpoint: str, body: Dict[str, Any]) -> None:
         raw_body = request.get_data(as_text=True)
     except Exception:  # pragma: no cover - defensive
         raw_body = str(body)
-    logger.debug("Incoming %s query params: %s", endpoint, query_params)
-    logger.debug("Incoming %s raw body: %s", endpoint, raw_body)
+    logger.debug(with_request_context("Incoming %s query params: %s"), endpoint, query_params)
+    logger.debug(with_request_context("Incoming %s raw body: %s"), endpoint, raw_body)
 
 
 def log_upstream_response(source: str | None, payload: Dict[str, Any]) -> None:
     name = source or "upstream"
-    logger.debug("Upstream %s response: %s", name, truncate_dict(payload))
+    logger.debug(with_request_context("Upstream %s response: %s"), name, truncate_dict(payload))
 
 
 def log_upstream_event(source: str | None, event: Any) -> None:
@@ -1036,7 +1152,12 @@ def log_upstream_event(source: str | None, event: Any) -> None:
             event_payload = vars(event)
         except TypeError:
             event_payload = str(event)
-    logger.debug("Upstream %s event: %s", name, truncate_dict(event_payload))
+    event_type = ""
+    if isinstance(event_payload, dict):
+        event_type = str(event_payload.get("type") or "")
+    if not LOG_STREAM_DELTAS and ".delta" in (event_type or "").lower():
+        return
+    logger.debug(with_request_context("Upstream %s event: %s"), name, truncate_dict(event_payload))
 
 
 def clean_dict(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1103,6 +1224,31 @@ def truncate_dict(obj: Any, limit: int = 500) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+def ensure_request_id() -> str | None:
+    if not has_request_context():
+        return None
+    existing = getattr(g, "request_id", None)
+    if existing:
+        return existing
+    incoming = request.headers.get(REQUEST_ID_HEADER)
+    req_id = (incoming or "").strip() or str(uuid.uuid4())
+    g.request_id = req_id
+    return req_id
+
+
+def get_request_id() -> str | None:
+    if not has_request_context():
+        return None
+    return getattr(g, "request_id", None)
+
+
+def with_request_context(message: str) -> str:
+    req_id = get_request_id()
+    if req_id:
+        return f"[req_id={req_id}] {message}"
+    return message
 
 
 def create_app() -> Flask:
