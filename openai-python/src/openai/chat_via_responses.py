@@ -40,6 +40,7 @@ _UNSUPPORTED_PARAMS = frozenset({
     "audio",
     "modalities",
     "prediction",
+    "stream_options",
 })
 
 
@@ -273,9 +274,9 @@ def _build_responses_payload(messages, model: str, **kwargs) -> Dict[str, Any]:
     if web_opts:
         payload.setdefault("tools", []).append({"type": "web_search_preview"})
 
-    # stream_options pass-through
-    if "stream_options" in kwargs and kwargs["stream_options"] is not None:
-        payload["stream_options"] = kwargs["stream_options"]
+    # stream_options: Responses API does not support this parameter, drop it
+    if "stream_options" in kwargs:
+        logger.debug("Dropping 'stream_options' (not supported by Responses API).")
 
     # Responses-only params that callers may pass via extra_body
     for key in ("include", "max_tool_calls", "previous_response_id", "conversation",
