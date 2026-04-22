@@ -15,10 +15,12 @@ OPENAI_SRC = PROJECT_ROOT / "openai-python" / "src"
 
 try:
     from openai import OpenAI
+    from openai.chat_via_responses import patch_client
 except ImportError:
     if OPENAI_SRC.exists():
         sys.path.insert(0, str(OPENAI_SRC))
         from openai import OpenAI
+        from openai.chat_via_responses import patch_client
     else:  # pragma: no cover - helps during misconfiguration
         raise RuntimeError(
             "Unable to import the openai SDK. Make sure openai-python/ exists with `src/`."
@@ -191,6 +193,10 @@ def index():
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# /v1/responses → chat completions upstream  (reverse path, kept as-is)
+# ═══════════════════════════════════════════════════════════════════════════
+
 @app.post("/respond")
 @app.post("/v1/responses")
 def respond_proxy():
@@ -224,6 +230,10 @@ def respond_proxy():
     return jsonify(translate_chat_to_respond(chat_response))
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# /v1/chat/completions → responses upstream  (main path, via SDK adapter)
+# ═══════════════════════════════════════════════════════════════════════════
+
 @app.post("/chat")
 @app.post("/v1/chat/completions")
 def chat_proxy():
@@ -237,7 +247,6 @@ def chat_proxy():
     body.setdefault("stream", stream_requested)
 
     log_request_details("/v1/chat/completions", body)
-    payload = build_respond_payload(body)
     incoming_key = extract_incoming_api_key(request)
 
     logger.debug(with_request_context("Incoming /v1/chat/completions Authorization: %s"), mask_token(incoming_key))
@@ -248,20 +257,130 @@ def chat_proxy():
         responses_upstream["base_url"],
         "/responses",
     )
-    logger.debug(with_request_context("Payload: %s"), truncate_dict(payload))
 
-    if stream_requested:
-        return stream_chat_completion(payload, incoming_key)
-
+    # Build a patched SDK client that routes chat → responses
     try:
-        respond_response = call_openai(
-            responses_upstream, "responses", payload, api_key_override=incoming_key
-        )
+        client = build_responses_client(responses_upstream, incoming_key)
     except UpstreamError as exc:
         return error_response(str(exc), 502)
 
-    return jsonify(translate_respond_to_chat(respond_response))
+    # Extract parameters from the incoming body for SDK call
+    messages = body.get("messages", [])
+    model = body.get("model") or "gpt-4.1-mini"
 
+    # Collect all extra kwargs to pass through
+    sdk_kwargs = _extract_sdk_kwargs(body)
+
+    if stream_requested:
+        return _stream_via_sdk(client, model, messages, sdk_kwargs)
+
+    try:
+        result = client.chat.completions.create(
+            model=model, messages=messages, stream=False, **sdk_kwargs
+        )
+    except Exception as exc:
+        logger.error(with_request_context("Upstream responses request failed: %s"), exc)
+        return error_response(str(exc), 502)
+
+    return jsonify(result.model_dump())
+
+
+def _stream_via_sdk(client, model, messages, sdk_kwargs):
+    """Stream chat completions via the SDK adapter, yielding SSE events."""
+
+    def generator():
+        try:
+            chunk_iter = client.chat.completions.create(
+                model=model, messages=messages, stream=True, **sdk_kwargs
+            )
+            for chunk in chunk_iter:
+                yield format_sse_data(chunk.model_dump())
+            yield SSE_DONE
+        except Exception as exc:
+            logger.error(with_request_context("Streaming responses upstream failed: %s"), exc)
+            yield format_sse_data({"error": {"message": str(exc)}})
+            yield SSE_DONE
+
+    return build_sse_response(generator)
+
+
+def _extract_sdk_kwargs(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Pull all recognized parameters from the incoming request body."""
+    kwargs: Dict[str, Any] = {}
+
+    # Direct scalar params
+    for key in (
+        "temperature", "top_p", "top_logprobs", "max_tokens", "max_completion_tokens",
+        "parallel_tool_calls", "metadata", "store", "service_tier",
+        "prompt_cache_key", "prompt_cache_retention", "safety_identifier", "user",
+        "frequency_penalty", "presence_penalty", "logit_bias", "logprobs",
+        "n", "seed", "stop", "audio", "modalities", "prediction", "verbosity",
+        "stream_options",
+    ):
+        if key in body:
+            kwargs[key] = body[key]
+
+    # Tools
+    if "tools" in body:
+        kwargs["tools"] = body["tools"]
+    if "functions" in body:
+        kwargs["functions"] = body["functions"]
+    if "tool_choice" in body:
+        kwargs["tool_choice"] = body["tool_choice"]
+    if "function_call" in body:
+        kwargs["function_call"] = body["function_call"]
+
+    # Reasoning
+    for key in ("reasoning", "reasoning_effort", "model_reasoning_effort"):
+        if key in body:
+            kwargs[key] = body[key]
+
+    # response_format
+    if "response_format" in body:
+        kwargs["response_format"] = body["response_format"]
+
+    # web_search_options
+    if "web_search_options" in body:
+        kwargs["web_search_options"] = body["web_search_options"]
+
+    # Responses-only passthrough (include, previous_response_id, etc.)
+    for key in ("include", "max_tool_calls", "previous_response_id", "conversation",
+                "instructions", "background"):
+        if key in body:
+            kwargs[key] = body[key]
+
+    # Apply default reasoning effort from env if not specified
+    if DEFAULT_REASONING_EFFORT and "reasoning" not in kwargs and "reasoning_effort" not in kwargs:
+        kwargs["reasoning_effort"] = DEFAULT_REASONING_EFFORT
+
+    return kwargs
+
+
+def build_responses_client(upstream: Dict[str, Any], api_key_override: str | None = None) -> OpenAI:
+    """Create an OpenAI client patched with ChatViaResponses adapter."""
+    api_key = api_key_override or upstream.get("api_key")
+    if not api_key:
+        hint = upstream.get("api_key_env")
+        raise UpstreamError(
+            f"Missing API key for {upstream.get('name')} ({hint} or OPENAI_API_KEY)."
+        )
+
+    client_kwargs: Dict[str, Any] = {
+        "api_key": api_key,
+        "base_url": upstream["base_url"],
+    }
+    if upstream.get("org_id"):
+        client_kwargs["organization"] = upstream["org_id"]
+
+    client = OpenAI(**client_kwargs)
+    patch_client(client)
+    return client
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Reverse path helpers: Responses → Chat Completions
+# (only used by /v1/responses endpoint)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def call_openai(
     upstream: Dict[str, Any], target: str, payload: Dict[str, Any], api_key_override: str | None = None
@@ -286,151 +405,6 @@ def call_openai(
     return data
 
 
-def stream_chat_completion(payload: Dict[str, Any], incoming_key: str | None):
-    try:
-        responses_stream = create_responses_stream(responses_upstream, payload, incoming_key)
-    except UpstreamError as exc:
-        return error_response(str(exc), 502)
-
-    def generator():
-        meta = {
-            "id": None,
-            "model": payload.get("model"),
-            "created": int(time.time()),
-        }
-        sent_role = False
-        reasoning_open = False
-        reasoning_accum: List[str] = []
-        tool_states: Dict[str, Dict[str, Any]] = {}
-        next_tool_index = 0
-        try:
-            with responses_stream as upstream_stream:
-                for event in upstream_stream:
-                    log_upstream_event(responses_upstream.get("name"), event)
-                    event_type = getattr(event, "type", "")
-                    if event_type == "response.created":
-                        response_info = getattr(event, "response", None)
-                        if response_info:
-                            meta["id"] = getattr(response_info, "id", None) or meta["id"]
-                            meta["model"] = getattr(response_info, "model", None) or meta["model"]
-                            created = getattr(response_info, "created_at", None) or getattr(
-                                response_info, "created", None
-                            )
-                            if created is not None:
-                                meta["created"] = int(created)
-                    elif event_type == "response.output_text.delta":
-                        delta_text = getattr(event, "delta", "") or ""
-                        if not delta_text:
-                            continue
-                        chunk = build_chat_stream_chunk(meta, delta_text, include_role=not sent_role)
-                        sent_role = True
-                        yield format_sse_data(chunk)
-                    elif event_type == "response.reasoning_text.delta":
-                        delta_text = getattr(event, "delta", "") or ""
-                        if not delta_text and reasoning_open:
-                            continue
-                        if not reasoning_open:
-                            prefix = build_chat_stream_chunk(
-                                meta, "[thinking]\n", include_role=not sent_role
-                            )
-                            sent_role = True
-                            reasoning_open = True
-                            yield format_sse_data(prefix)
-                        if delta_text:
-                            reasoning_accum.append(delta_text)
-                            chunk = build_chat_stream_chunk(meta, delta_text, include_role=False)
-                            yield format_sse_data(chunk)
-                    elif event_type == "response.reasoning_text.done":
-                        if reasoning_open:
-                            reasoning_open = False
-                            suffix = build_chat_stream_chunk(
-                                meta, "\n[/thinking]\n", include_role=False
-                            )
-                            yield format_sse_data(suffix)
-                    elif event_type == "response.completed":
-                        if reasoning_open:
-                            reasoning_open = False
-                            suffix = build_chat_stream_chunk(
-                                meta, "\n[/thinking]\n", include_role=False
-                            )
-                            yield format_sse_data(suffix)
-                        response_info = getattr(event, "response", None)
-                        reasoning_text = "".join(reasoning_accum).strip() or None
-                        chunk = build_chat_finish_chunk(meta, response_info, reasoning_text)
-                        reasoning_accum.clear()
-                        yield format_sse_data(chunk)
-                    elif event_type == "response.output_item.added":
-                        item = getattr(event, "item", None)
-                        if not item:
-                            continue
-                        item_type = getattr(item, "type", "")
-                        if item_type != "function_call":
-                            continue
-                        item_id = getattr(item, "id", None) or getattr(item, "call_id", None)
-                        if not item_id:
-                            item_id = f"tool_item_{len(tool_states)}"
-                        call_id = getattr(item, "call_id", None) or item_id
-                        name = getattr(item, "name", None) or ""
-                        state = {
-                            "index": next_tool_index,
-                            "id": call_id,
-                            "name": name,
-                            "arguments": "",
-                        }
-                        tool_states[item_id] = state
-                        next_tool_index += 1
-                        tool_delta = {
-                            "index": state["index"],
-                            "id": state["id"],
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": "",
-                            },
-                        }
-                        chunk = build_chat_tool_delta_chunk(meta, [tool_delta], include_role=not sent_role)
-                        sent_role = True
-                        yield format_sse_data(chunk)
-                    elif event_type == "response.function_call_arguments.delta":
-                        item_id = getattr(event, "item_id", None)
-                        delta_text = getattr(event, "delta", "") or ""
-                        if not item_id or not delta_text:
-                            continue
-                        state = tool_states.get(item_id)
-                        if not state:
-                            continue
-                        state["arguments"] += delta_text
-                        tool_delta = {
-                            "index": state["index"],
-                            "function": {
-                                "arguments": delta_text,
-                            },
-                        }
-                        chunk = build_chat_tool_delta_chunk(meta, [tool_delta], include_role=not sent_role)
-                        sent_role = True
-                        yield format_sse_data(chunk)
-                    elif event_type == "response.function_call_arguments.done":
-                        item_id = getattr(event, "item_id", None)
-                        if not item_id:
-                            continue
-                        state = tool_states.get(item_id)
-                        if not state:
-                            continue
-                        final_args = getattr(event, "arguments", None)
-                        final_name = getattr(event, "name", None)
-                        if isinstance(final_args, str) and final_args:
-                            state["arguments"] = final_args
-                        if final_name:
-                            state["name"] = final_name
-                yield SSE_DONE
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.error(with_request_context("Streaming responses upstream failed: %s"), exc)
-            yield format_sse_data({"error": {"message": str(exc)}})
-            yield SSE_DONE
-
-    return build_sse_response(generator)
-
-
 def build_openai_client(upstream: Dict[str, Any], api_key_override: str | None = None) -> OpenAI:
     api_key = api_key_override or upstream.get("api_key")
     if not api_key:
@@ -449,134 +423,8 @@ def build_openai_client(upstream: Dict[str, Any], api_key_override: str | None =
     return OpenAI(**client_kwargs)
 
 
-def create_responses_stream(
-    upstream: Dict[str, Any], payload: Dict[str, Any], api_key_override: str | None
-):
-    client = build_openai_client(upstream, api_key_override)
-    payload_to_send = dict(payload)
-    payload_to_send.pop("stream", None)
-    try:
-        return client.responses.stream(**payload_to_send)
-    except Exception as exc:
-        logger.error(with_request_context("Failed to open responses stream via %s: %s"), upstream.get("name"), exc)
-        raise UpstreamError(str(exc)) from exc
-
-
-def build_chat_stream_chunk(meta: Dict[str, Any], delta_text: str, include_role: bool = False) -> Dict[str, Any]:
-    chunk = {
-        "id": meta.get("id") or "chatcmpl-temp",
-        "object": "chat.completion.chunk",
-        "created": meta.get("created") or int(time.time()),
-        "model": meta.get("model") or "unknown",
-        "choices": [
-            {
-                "index": 0,
-                "delta": {
-                    "content": delta_text,
-                },
-                "finish_reason": None,
-            }
-        ],
-    }
-    if include_role:
-        chunk["choices"][0]["delta"]["role"] = "assistant"
-    return chunk
-
-
-def build_chat_tool_delta_chunk(
-    meta: Dict[str, Any], tool_deltas: List[Dict[str, Any]], include_role: bool = False
-) -> Dict[str, Any]:
-    chunk = {
-        "id": meta.get("id") or "chatcmpl-temp",
-        "object": "chat.completion.chunk",
-        "created": meta.get("created") or int(time.time()),
-        "model": meta.get("model") or "unknown",
-        "choices": [
-            {
-                "index": 0,
-                "delta": {
-                    "tool_calls": tool_deltas,
-                },
-                "finish_reason": None,
-            }
-        ],
-    }
-    if include_role:
-        chunk["choices"][0]["delta"]["role"] = "assistant"
-    return chunk
-
-
-def build_chat_finish_chunk(
-    meta: Dict[str, Any], response_info: Any | None, reasoning_text: str | None = None
-) -> Dict[str, Any]:
-    finish_reason = map_stop_reason(getattr(response_info, "stop_reason", None))
-    if response_info is not None:
-        output_items = getattr(response_info, "output", None)
-        if collect_tool_calls_from_output(output_items):
-            finish_reason = "tool_calls"
-    chunk = {
-        "id": meta.get("id") or "chatcmpl-temp",
-        "object": "chat.completion.chunk",
-        "created": meta.get("created") or int(time.time()),
-        "model": meta.get("model") or "unknown",
-        "choices": [
-            {
-                "index": 0,
-                "delta": {},
-                "finish_reason": finish_reason,
-            }
-        ],
-    }
-    usage = getattr(response_info, "usage", None)
-    if usage:
-        chunk["usage"] = usage.model_dump()
-    if reasoning_text:
-        chunk["choices"][0]["metadata"] = {"reasoning": reasoning_text}
-    return chunk
-
-
-def map_stop_reason(value: str | None) -> str:
-    mapping = {
-        None: "stop",
-        "stop": "stop",
-        "end_turn": "stop",
-        "max_tokens": "length",
-        "length": "length",
-        "tool_use": "tool_calls",
-        "tool_calls": "tool_calls",
-    }
-    return mapping.get(value, "stop")
-
-
-def format_sse_data(payload: Dict[str, Any]) -> str:
-    return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
-
-
-def build_sse_response(generator_fn):
-    response = Response(stream_with_context(generator_fn()), mimetype="text/event-stream")
-    response.headers["Cache-Control"] = "no-cache"
-    response.headers["Connection"] = "keep-alive"
-    response.headers["X-Accel-Buffering"] = "no"
-    return response
-
-
-def get_json_body() -> Dict[str, Any]:
-    if not request.data:
-        return {}
-
-    try:
-        data = request.get_json(force=True, silent=False)
-    except Exception as exc:  # pragma: no cover
-        raise ForwarderError("Invalid JSON body.") from exc
-
-    return data or {}
-
-
-def error_response(message: str, status: int):
-    return jsonify({"error": message}), status
-
-
 def build_chat_completion_payload(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Responses-format body to Chat Completions payload (reverse path)."""
     messages = convert_respond_input_to_chat_messages(body.get("input", []))
 
     payload = clean_dict(
@@ -619,52 +467,6 @@ def build_chat_completion_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def build_respond_payload(body: Dict[str, Any]) -> Dict[str, Any]:
-    input_blocks = convert_chat_messages_to_respond_input(body.get("messages", []))
-    reasoning = extract_reasoning_config(body)
-    tools = convert_tools_for_responses(body.get("tools"), body.get("functions"))
-    tool_choice = extract_tool_choice_for_responses(body)
-    include = normalize_include_values(body.get("include"))
-
-    payload = clean_dict(
-        {
-            "model": body.get("model") or "gpt-4.1-mini",
-            "input": input_blocks,
-            "temperature": body.get("temperature"),
-            "max_output_tokens": body.get("max_tokens"),
-            "top_p": body.get("top_p"),
-            "frequency_penalty": body.get("frequency_penalty"),
-            "presence_penalty": body.get("presence_penalty"),
-            "stop": body.get("stop"),
-            "reasoning": reasoning,
-            "tools": tools,
-            "tool_choice": tool_choice,
-            "include": include,
-        }
-    )
-
-    add_optional_fields(
-        payload,
-        body,
-        [
-            "metadata",
-            "max_tool_calls",
-            "parallel_tool_calls",
-            "service_tier",
-            "store",
-            "prompt_cache_key",
-            "prompt_cache_retention",
-            "conversation",
-            "previous_response_id",
-            "instructions",
-            "safety_identifier",
-            "background",
-        ],
-    )
-
-    return payload
-
-
 def convert_respond_input_to_chat_messages(input_payload: Any) -> List[Dict[str, Any]]:
     items = input_payload if isinstance(input_payload, list) else [input_payload]
     messages: List[Dict[str, Any]] = []
@@ -684,301 +486,8 @@ def convert_respond_input_to_chat_messages(input_payload: Any) -> List[Dict[str,
     return messages
 
 
-def convert_chat_messages_to_respond_input(messages_payload: Any) -> List[Dict[str, Any]]:
-    items = messages_payload if isinstance(messages_payload, list) else [messages_payload]
-    blocks: List[Dict[str, Any]] = []
-    tool_response_counter = 0
-
-    for message in items:
-        if not message:
-            continue
-
-        role = (message.get("role") or "user").lower()
-
-        if role == "tool":
-            tool_response_counter += 1
-            tool_response = convert_tool_response_message(message, tool_response_counter)
-            if tool_response:
-                blocks.append(tool_response)
-            continue
-
-        content_block = convert_standard_message_to_response_block(message)
-        if content_block:
-            blocks.append(content_block)
-
-        tool_call_blocks = convert_tool_calls_from_message(message)
-        if tool_call_blocks:
-            blocks.extend(tool_call_blocks)
-
-    return blocks
-
-
-def convert_standard_message_to_response_block(message: Dict[str, Any]) -> Dict[str, Any] | None:
-    role = message.get("role") or "user"
-    content_entries = build_response_content_entries(message.get("content"), role)
-    if not content_entries:
-        return None
-
-    return {
-        "role": role,
-        "content": content_entries,
-    }
-
-
-def convert_tool_response_message(message: Dict[str, Any], fallback_index: int) -> Dict[str, Any] | None:
-    call_id = message.get("tool_call_id") or message.get("id") or f"tool_call_{fallback_index}"
-    output_content = extract_text(message.get("content"))
-    if call_id and output_content != "":
-        return {
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": output_content,
-        }
-    return None
-
-
-def convert_tool_calls_from_message(message: Dict[str, Any]) -> List[Dict[str, Any]]:
-    calls: List[Dict[str, Any]] = []
-    raw_calls = []
-
-    if isinstance(message.get("tool_calls"), list):
-        raw_calls.extend(message["tool_calls"])
-    if message.get("function_call"):
-        raw_calls.append({"type": "function", "id": message.get("id"), "function": message["function_call"]})
-
-    for index, raw in enumerate(raw_calls):
-        call_block = convert_single_tool_call(raw, index)
-        if call_block:
-            calls.append(call_block)
-
-    return calls
-
-
-def convert_single_tool_call(tool_call: Any, ordinal: int) -> Dict[str, Any] | None:
-    if not isinstance(tool_call, dict):
-        return None
-
-    tool_type = (tool_call.get("type") or "").lower()
-    if tool_type not in ("function", "function_call"):
-        return None
-
-    function_detail = tool_call.get("function") or {}
-    if not isinstance(function_detail, dict):
-        return None
-
-    name = function_detail.get("name")
-    if not name:
-        return None
-
-    call_id = tool_call.get("id") or tool_call.get("call_id") or f"tool_call_{ordinal}"
-    arguments = stringify_function_arguments(function_detail.get("arguments"))
-
-    return {
-        "type": "function_call",
-        "name": name,
-        "arguments": arguments,
-        "call_id": call_id,
-    }
-
-
-def stringify_function_arguments(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    try:
-        return json.dumps(value, separators=(",", ":"))
-    except Exception:
-        return str(value)
-
-
-def convert_tools_for_responses(tools_field: Any, legacy_functions: Any) -> List[Dict[str, Any]] | None:
-    converted: List[Dict[str, Any]] = []
-
-    if isinstance(tools_field, list):
-        for tool in tools_field:
-            normalized = normalize_responses_tool(tool)
-            if normalized:
-                converted.append(normalized)
-
-    if isinstance(legacy_functions, list):
-        for function_def in legacy_functions:
-            normalized = convert_function_definition_to_tool(function_def)
-            if normalized:
-                converted.append(normalized)
-
-    return converted or None
-
-
-def normalize_responses_tool(tool: Any) -> Dict[str, Any] | None:
-    if not isinstance(tool, dict):
-        return None
-
-    tool_type = (tool.get("type") or "").lower()
-    if tool_type == "function":
-        function_def = tool.get("function") if "function" in tool else tool
-        return convert_function_definition_to_tool(function_def)
-
-    return tool
-
-
-def normalize_include_values(include_field: Any) -> List[str] | None:
-    if include_field is None:
-        return None
-    values: List[str] = []
-    if isinstance(include_field, str):
-        cleaned = include_field.strip()
-        if cleaned:
-            maybe_add_include_value(cleaned, values)
-    elif isinstance(include_field, (list, tuple, set)):
-        for entry in include_field:
-            if isinstance(entry, str):
-                cleaned = entry.strip()
-                if cleaned:
-                    maybe_add_include_value(cleaned, values)
-    else:
-        return None
-    return values or None
-
-
-def maybe_add_include_value(candidate: str, values: List[str]) -> None:
-    if candidate in ALLOWED_INCLUDE_VALUES:
-        values.append(candidate)
-    else:
-        logger.warning(with_request_context("Dropping unsupported include value: %s"), candidate)
-
-
-def build_response_content_entries(raw_content: Any, role: str) -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    if isinstance(raw_content, list):
-        for item in raw_content:
-            entry = convert_chat_content_part(item, role)
-            if entry:
-                entries.append(entry)
-    elif isinstance(raw_content, dict):
-        entry = convert_chat_content_part(raw_content, role)
-        if entry:
-            entries.append(entry)
-    else:
-        text = extract_text(raw_content)
-        if text:
-            entry = build_text_entry(text, role)
-            if entry:
-                entries.append(entry)
-    return entries
-
-
-def convert_chat_content_part(part: Any, role: str) -> Dict[str, Any] | None:
-    if isinstance(part, str):
-        return build_text_entry(part, role)
-    if not isinstance(part, dict):
-        return None
-
-    part_type = (part.get("type") or "").lower()
-    if part_type in ("text", "input_text", "output_text"):
-        text_value = part.get("text")
-        if not text_value:
-            text_value = extract_text(part.get("content"))
-        if text_value:
-            return build_text_entry(text_value, role)
-        return None
-
-    if part_type in ("image_url", "input_image"):
-        if (role or "").lower() == "assistant":
-            return None
-        image_payload = part.get("image_url")
-        url: str | None = None
-        detail = (part.get("detail") or "auto").lower() if isinstance(part.get("detail"), str) else None
-        if isinstance(image_payload, dict):
-            url = image_payload.get("url")
-            detail = image_payload.get("detail") or detail
-        elif isinstance(image_payload, str):
-            url = image_payload
-        if not url:
-            url = part.get("url")
-        if not detail:
-            detail = "auto"
-        if url:
-            entry: Dict[str, Any] = {
-                "type": "input_image",
-                "image_url": url,
-                "detail": detail,
-            }
-            if part.get("file_id"):
-                entry["file_id"] = part["file_id"]
-            return entry
-    return None
-
-
-def build_text_entry(text: str, role: str) -> Dict[str, Any] | None:
-    if not text:
-        return None
-    content_type = "output_text" if (role or "").lower() == "assistant" else "input_text"
-    return {"type": content_type, "text": text}
-
-
-def convert_function_definition_to_tool(function_def: Any) -> Dict[str, Any] | None:
-    if not isinstance(function_def, dict):
-        return None
-
-    name = function_def.get("name")
-    if not name:
-        return None
-
-    parameters = function_def.get("parameters")
-    if parameters is None:
-        parameters = {"type": "object", "properties": {}}
-
-    tool: Dict[str, Any] = {
-        "type": "function",
-        "name": name,
-        "description": function_def.get("description"),
-        "parameters": parameters,
-        "strict": function_def.get("strict"),
-    }
-    return tool
-
-
-def extract_tool_choice_for_responses(body: Dict[str, Any]) -> Any:
-    if "tool_choice" in body:
-        return body.get("tool_choice")
-    if "function_call" not in body:
-        return None
-
-    legacy_choice = body.get("function_call")
-    if isinstance(legacy_choice, str):
-        lowered = legacy_choice.lower()
-        if lowered in {"none", "auto", "required"}:
-            return lowered
-        return None
-    if isinstance(legacy_choice, dict):
-        name = legacy_choice.get("name")
-        if name:
-            return {"type": "function", "name": name}
-    return None
-
-
-def extract_reasoning_config(body: Dict[str, Any]) -> Dict[str, Any] | None:
-    reasoning = body.get("reasoning")
-    if isinstance(reasoning, dict) and reasoning:
-        return reasoning
-    if isinstance(reasoning, str) and reasoning.strip():
-        return {"effort": reasoning.strip()}
-
-    for key in ("reasoning_effort", "model_reasoning_effort"):
-        reasoning_effort = body.get(key)
-        if isinstance(reasoning_effort, str) and reasoning_effort.strip():
-            return {"effort": reasoning_effort.strip()}
-        if isinstance(reasoning_effort, dict) and reasoning_effort.get("effort"):
-            return reasoning_effort
-
-    if DEFAULT_REASONING_EFFORT:
-        return {"effort": DEFAULT_REASONING_EFFORT}
-
-    return None
-
-
 def translate_chat_to_respond(chat: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Chat Completions response to Responses format (reverse path)."""
     choices = chat.get("choices") or []
     choice = choices[0] if choices else {}
     message = (choice or {}).get("message") or {}
@@ -1006,48 +515,9 @@ def translate_chat_to_respond(chat: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def translate_respond_to_chat(respond: Dict[str, Any]) -> Dict[str, Any]:
-    output = respond.get("output") or []
-    message_block = next(
-        (block for block in output if block and block.get("type") == "message"), {}
-    )
-    content = message_block.get("content") or []
-    reasoning_text = collect_reasoning_text(output)
-    final_content = extract_text(content)
-    metadata = None
-    if reasoning_text:
-        final_content = f"[thinking]\n{reasoning_text}\n[/thinking]\n{final_content}"
-        metadata = {"reasoning": reasoning_text}
-
-    tool_calls = collect_tool_calls_from_output(output)
-
-    message_payload = {
-        "role": message_block.get("role") or "assistant",
-        "content": final_content if final_content != "" else "",
-    }
-    if metadata:
-        message_payload["metadata"] = metadata
-    if tool_calls:
-        message_payload["tool_calls"] = tool_calls
-        if len(tool_calls) == 1:
-            message_payload["function_call"] = tool_calls[0]["function"]
-
-    finish_reason = "tool_calls" if tool_calls else (respond.get("stop_reason") or "stop")
-    return {
-        "id": respond.get("id"),
-        "object": "chat.completion",
-        "created": respond.get("created"),
-        "model": respond.get("model"),
-        "usage": respond.get("usage"),
-        "choices": [
-            {
-                "index": 0,
-                "finish_reason": finish_reason,
-                "message": message_payload,
-            }
-        ],
-    }
-
+# ═══════════════════════════════════════════════════════════════════════════
+# Shared utilities
+# ═══════════════════════════════════════════════════════════════════════════
 
 def extract_text(content: Any) -> str:
     if isinstance(content, str):
@@ -1069,63 +539,42 @@ def extract_text(content: Any) -> str:
     return ""
 
 
-def collect_reasoning_text(output: List[Dict[str, Any]]) -> str:
-    parts: List[str] = []
-    for block in output or []:
-        if not block:
-            continue
-        block_type = (block.get("type") or "").lower()
-        if block_type == "reasoning":
-            parts.append(extract_text(block.get("content")))
-            continue
-        if block_type != "message":
-            continue
-        for entry in block.get("content") or []:
-            entry_type = (entry.get("type") or "").lower() if isinstance(entry, dict) else ""
-            if "reasoning" in entry_type:
-                parts.append(extract_text(entry.get("content") or entry))
-    return "\n".join([part for part in parts if part])
+def format_sse_data(payload: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
 
-def collect_tool_calls_from_output(output: Any) -> List[Dict[str, Any]]:
-    calls: List[Dict[str, Any]] = []
-    for block in output or []:
-        if not block:
-            continue
-        normalized = normalize_output_block(block)
-        block_type = (normalized.get("type") or "").lower()
-        if block_type not in {"function_call"}:
-            continue
-        name = normalized.get("name")
-        if not name:
-            continue
-        call_id = normalized.get("call_id") or normalized.get("id") or f"tool_call_{len(calls)}"
-        arguments = stringify_function_arguments(normalized.get("arguments"))
-        calls.append(
-            {
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": arguments,
-                },
-            }
-        )
-    return calls
+def build_sse_response(generator_fn):
+    response = Response(stream_with_context(generator_fn()), mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Connection"] = "keep-alive"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
 
 
-def normalize_output_block(block: Any) -> Dict[str, Any]:
-    if isinstance(block, dict):
-        return block
-    if hasattr(block, "model_dump"):
-        try:
-            return block.model_dump()
-        except Exception:
-            pass
-    try:
-        return vars(block)
-    except Exception:
+def get_json_body() -> Dict[str, Any]:
+    if not request.data:
         return {}
+
+    try:
+        data = request.get_json(force=True, silent=False)
+    except Exception as exc:  # pragma: no cover
+        raise ForwarderError("Invalid JSON body.") from exc
+
+    return data or {}
+
+
+def error_response(message: str, status: int):
+    return jsonify({"error": message}), status
+
+
+def clean_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in data.items() if value is not None}
+
+
+def add_optional_fields(target: Dict[str, Any], source: Dict[str, Any], keys: List[str]) -> None:
+    for key in keys:
+        if key in source:
+            target[key] = source[key]
 
 
 def log_request_details(endpoint: str, body: Dict[str, Any]) -> None:
@@ -1141,33 +590,6 @@ def log_request_details(endpoint: str, body: Dict[str, Any]) -> None:
 def log_upstream_response(source: str | None, payload: Dict[str, Any]) -> None:
     name = source or "upstream"
     logger.debug(with_request_context("Upstream %s response: %s"), name, truncate_dict(payload))
-
-
-def log_upstream_event(source: str | None, event: Any) -> None:
-    name = source or "upstream"
-    try:
-        event_payload = event.model_dump()
-    except AttributeError:
-        try:
-            event_payload = vars(event)
-        except TypeError:
-            event_payload = str(event)
-    event_type = ""
-    if isinstance(event_payload, dict):
-        event_type = str(event_payload.get("type") or "")
-    if not LOG_STREAM_DELTAS and ".delta" in (event_type or "").lower():
-        return
-    logger.debug(with_request_context("Upstream %s event: %s"), name, truncate_dict(event_payload))
-
-
-def clean_dict(data: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: value for key, value in data.items() if value is not None}
-
-
-def add_optional_fields(target: Dict[str, Any], source: Dict[str, Any], keys: List[str]) -> None:
-    for key in keys:
-        if key in source:
-            target[key] = source[key]
 
 
 def describe_upstream(upstream: Dict[str, Any]) -> Dict[str, Any]:

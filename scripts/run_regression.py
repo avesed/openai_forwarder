@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Quick regression checks for the Responses → Chat forwarder.
 
-This script doesn't hit real network endpoints. It simply exercises the core
-translation helpers inside src/server.py to make sure we don't regress the
-Chat→Responses or Responses→Chat transformations (reasoning blocks, tool calls,
-etc.). It exits with code 0 on success and raises AssertionError otherwise.
+This script doesn't hit real network endpoints. It exercises the core
+translation helpers to make sure we don't regress the Chat→Responses or
+Responses→Chat transformations (reasoning blocks, tool calls, etc.).
+It exits with code 0 on success and raises AssertionError otherwise.
 """
 
 from __future__ import annotations
@@ -14,15 +14,26 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-# Ensure server module can be imported without real credentials
+# Ensure modules can be imported without real credentials
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+OPENAI_SRC = REPO_ROOT / "openai-python" / "src"
+if str(OPENAI_SRC) not in sys.path:
+    sys.path.insert(0, str(OPENAI_SRC))
+
 try:
-    from src.server import build_respond_payload, translate_respond_to_chat  # noqa: E402
+    # SDK adapter (chat → responses direction)
+    from openai.chat_via_responses import (
+        _build_responses_payload,
+        _response_to_chat_completion,
+        _messages_to_input,
+    )
+    # Server helpers (responses → chat direction)
+    from src.server import translate_chat_to_respond, build_chat_completion_payload
 except ModuleNotFoundError as exc:  # pragma: no cover - import-time guard
     missing = str(exc)
     raise SystemExit(
@@ -43,39 +54,41 @@ def assert_true(condition: bool, message: str) -> None:
 
 
 def run_chat_to_responses_case() -> None:
-    body: Dict[str, Any] = {
-        "model": "gpt-test",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "天气如何？"},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": "https://example.com/weather.png", "detail": "low"},
-                    },
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": "我去查一下天气。",
-                "tool_calls": [
-                    {
-                        "id": "call-weather-1",
-                        "type": "function",
-                        "function": {"name": "get_weather", "arguments": '{"city":"shanghai"}'},
-                    }
-                ],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": "call-weather-1",
-                "content": "多云转晴",
-            },
-        ],
-        "reasoning": "medium",
-        "include": "reasoning",
-        "tools": [
+    """Test: Chat Completions body → Responses API payload (via SDK adapter)."""
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "天气如何？"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/weather.png", "detail": "low"},
+                },
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "我去查一下天气。",
+            "tool_calls": [
+                {
+                    "id": "call-weather-1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"city":"shanghai"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-weather-1",
+            "content": "多云转晴",
+        },
+    ]
+
+    payload = _build_responses_payload(
+        messages=messages,
+        model="gpt-test",
+        reasoning="medium",
+        tools=[
             {
                 "type": "function",
                 "function": {
@@ -86,12 +99,9 @@ def run_chat_to_responses_case() -> None:
                 },
             }
         ],
-    }
-
-    payload = build_respond_payload(body)
+    )
 
     assert_equal(payload.get("reasoning"), {"effort": "medium"}, "Reasoning config")
-    assert_equal(payload.get("include"), ["reasoning"], "Include should be normalized list")
 
     first_block = payload["input"][0]
     user_content = first_block.get("content") or []
@@ -108,8 +118,8 @@ def run_chat_to_responses_case() -> None:
         block for block in payload.get("input", []) if block.get("type") == "function_call_output"
     ]
 
-    assert_true(function_calls, "Tool call should be converted into function_call input")
-    assert_true(outputs, "Tool response should be converted into function_call_output input")
+    assert_true(bool(function_calls), "Tool call should be converted into function_call input")
+    assert_true(bool(outputs), "Tool response should be converted into function_call_output input")
 
     call = function_calls[0]
     assert_equal(call.get("call_id"), "call-weather-1", "Function call id")
@@ -121,11 +131,12 @@ def run_chat_to_responses_case() -> None:
 
 
 def run_responses_to_chat_case() -> None:
+    """Test: Responses API output → Chat Completions format (via SDK adapter)."""
     respond_payload: Dict[str, Any] = {
         "id": "resp_123",
-        "created": 111,
+        "created_at": 111,
         "model": "gpt-test",
-        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        "usage": {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30},
         "stop_reason": "tool_use",
         "output": [
             {
@@ -148,7 +159,7 @@ def run_responses_to_chat_case() -> None:
         ],
     }
 
-    chat_result = translate_respond_to_chat(respond_payload)
+    chat_result = _response_to_chat_completion(respond_payload, "gpt-test")
     choice = chat_result["choices"][0]
     message = choice["message"]
 
@@ -156,22 +167,44 @@ def run_responses_to_chat_case() -> None:
         "[thinking]" in message["content"],
         "Reasoning text should be wrapped with [thinking] tags in message content",
     )
-    assert_equal(
-        message.get("metadata", {}).get("reasoning"),
-        "先查看用户已使用的工具...",
-        "Reasoning metadata should match the original reasoning text",
-    )
 
     tool_calls = message.get("tool_calls")
-    assert_true(tool_calls, "Tool calls should be present in translated chat response")
+    assert_true(bool(tool_calls), "Tool calls should be present in translated chat response")
     assert_equal(tool_calls[0]["function"]["name"], "get_weather", "Tool call name in chat response")
     assert_equal(choice["finish_reason"], "tool_calls", "Finish reason should reflect tool usage")
+
+
+def run_reverse_path_case() -> None:
+    """Test: Responses body → Chat Completions payload (reverse path in server.py)."""
+    chat_response: Dict[str, Any] = {
+        "id": "chatcmpl-abc",
+        "created": 999,
+        "model": "gpt-test",
+        "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15},
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "Hello!"},
+            }
+        ],
+    }
+
+    respond_result = translate_chat_to_respond(chat_response)
+    assert_equal(respond_result["object"], "response", "Should be response object")
+    assert_equal(respond_result["output"][0]["type"], "message", "Output should contain message block")
+    assert_equal(
+        respond_result["output"][0]["content"][0]["text"],
+        "Hello!",
+        "Text should be preserved",
+    )
 
 
 def main() -> None:
     run_chat_to_responses_case()
     run_responses_to_chat_case()
-    print("✅ Regression checks passed: chat↔responses translation looks good.")
+    run_reverse_path_case()
+    print("Regression checks passed: chat<->responses translation looks good.")
 
 
 if __name__ == "__main__":
